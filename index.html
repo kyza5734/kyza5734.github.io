@@ -214,6 +214,15 @@
   #office.lit .doorlbl{color:#e0b070}
   @keyframes peekPulse{0%,100%{filter:drop-shadow(0 0 0 rgba(255,60,60,0))}
     50%{filter:drop-shadow(0 0 16px rgba(255,50,50,.55))}}
+  /* Маркиз шипит и дёргается от света, но с места не уходит */
+  #office.lit .peek.show.hiss{animation:hissFlinch .5s ease-out}
+  @keyframes hissFlinch{
+    0%{transform:translate(-50%,-46%) scale(.96)}
+    18%{transform:translate(-50%,-50%) scale(1.05) rotate(-2deg);filter:brightness(1.7) saturate(.3)}
+    45%{transform:translate(-49%,-45%) scale(.98) rotate(2deg)}
+    72%{transform:translate(-51%,-47%) scale(1.01) rotate(-1deg)}
+    100%{transform:translate(-50%,-46%) scale(.96)}
+  }
   .doorlbl{position:absolute;bottom:2%;left:0;right:0;text-align:center;font-size:11px;
     letter-spacing:2px;color:#6f6659}
   .door.closed .doorlbl{color:#c96a4a}
@@ -687,6 +696,8 @@ const HOUR_SECONDS = 28;          // сколько секунд длится о
 const MAX_NIGHT = 6;
 const NIGHT_SPEED = [0, 7.6, 6.3, 5.2, 4.3, 3.5, 2.7];   // пауза между шагами Маркиза
 const POWER = { base: 0.20, door: 0.95, cam: 0.75, light: 0.80 };   // база медленнее, зато каждая дверь/свет/камера жрёт заметно сильнее
+const HISS_CD = 2.0;              // перезарядка «шипения» на свет (сек)
+const HISS_TIME = 0.5;            // сколько длится «дёрнулся» (сек)
 const ATTACK_DELAY = 2.4;
 const RETREAT_TIME = 1.0;
 const FOOD_DRAIN = [0, 1.15, 1.30, 1.45, 1.60, 1.75, 1.90];  // сколько % корма тратится в секунду (по ночам)
@@ -1080,7 +1091,10 @@ const S = {
   foodLow: false,    // предупреждение уже показали
   paused: false,
   events: [],
-  fsT: 0
+  fsT: 0,
+  hissT: 0,          // остаток анимации «отшатнулся от света»
+  hissCd: 0,         // перезарядка шипения
+  hissSide: null     // 'L' | 'R'
 };
 
 function emit(type, data) { S.events.push({ type: type, data: data || null }); }
@@ -1105,6 +1119,9 @@ function newGame(night) {
   S.food = 100;
   S.hungry = false;
   S.foodLow = false;
+  S.hissT = 0;
+  S.hissCd = 0;
+  S.hissSide = null;
   S.paused = false;
   S.events.length = 0;
 }
@@ -1125,6 +1142,17 @@ function toggleLight() {
   if (S.mode !== 'play') return;
   S.light = !S.light;
   emit('light', S.light);
+  if (!S.light) return;
+
+  // посветил в открытую дверь, а там Маркиз — шипит и дёргается (но не уходит)
+  const atDoor = S.stage >= ROOMS.length;
+  const doorOpen = S.side === 'L' ? !S.doorL : !S.doorR;
+  if (atDoor && doorOpen && S.hissCd <= 0) {
+    S.hissCd = HISS_CD;
+    S.hissT = HISS_TIME;
+    S.hissSide = S.side;
+    emit('hiss', null);
+  }
 }
 
 /* насыпать корм — только с камеры кухни (КАМ 1) */
@@ -1135,6 +1163,10 @@ function feedMarquis() {
   S.food = Math.min(100, S.food + FOOD_REFILL);
   if (S.food > 0) S.hungry = false;
   if (S.food > FOOD_LOW) S.foodLow = false;
+  GAME.feeds += 1;
+  persist();
+  if (GAME.feeds === 1) achUnlock('feed1');
+  if (GAME.feeds === 10) achUnlock('feed10');
   emit('feed', null);
   render();
 }
@@ -1250,6 +1282,10 @@ function tick(dt) {
   }
 
   S.t += dt;
+
+  // реакция Маркиза на свет
+  if (S.hissT > 0) S.hissT = Math.max(0, S.hissT - dt);
+  if (S.hissCd > 0) S.hissCd = Math.max(0, S.hissCd - dt);
 
   // время
   const h = Math.floor(S.t / HOUR_SECONDS);
@@ -1494,6 +1530,12 @@ const Audio_ = {
     o.connect(f); f.connect(g); g.connect(this.master);
     o.start(t); o.stop(t + 0.5);
   },
+  hiss: function () {
+    // сухое злое «шшш»: шум + низкое рычание
+    this.noise(0.42, 0.45, 'highpass', 3600);
+    this.noise(0.30, 0.30, 'bandpass', 2200, 1.6);
+    this.tone(190, 0.28, 0.12, 'sawtooth', 85);
+  },
   staticOn: function () {
     if (!this.ctx || this.staticNode) return;
     const src = this.ctx.createBufferSource();
@@ -1596,12 +1638,15 @@ function render() {
   cache.btnLight.classList.toggle('on', S.light);
   cache.office.classList.toggle('lit', S.light && S.mode !== 'powerout');
 
-  // Маркиз в проёме
+  // Маркиз в проёме (+ анимация «отшатнулся от света»)
   const atDoor = S.stage >= ROOMS.length;
-  const showL = atDoor && S.side === 'L' && !S.doorL && S.light;
-  const showR = atDoor && S.side === 'R' && !S.doorR && S.light;
+  const hissing = S.hissT > 0 ? S.hissSide : null;
+  const showL = (atDoor && S.side === 'L' && !S.doorL && S.light) || hissing === 'L';
+  const showR = (atDoor && S.side === 'R' && !S.doorR && S.light) || hissing === 'R';
   cache.peekL.classList.toggle('show', showL);
   cache.peekR.classList.toggle('show', showR);
+  cache.peekL.classList.toggle('hiss', hissing === 'L');
+  cache.peekR.classList.toggle('hiss', hissing === 'R');
 
   // предупреждение
   const near = S.light && (atDoor || S.stage === ROOMS.length - 1);
@@ -1856,7 +1901,9 @@ const GAME = {
   owned: ['steel', 'normal', 'default'],
   equip: { doors: 'steel', marquis: 'normal', office: 'default' },
   cleared: [],
-  lastCoin: 0
+  lastCoin: 0,
+  ach: [],        // id открытых достижений
+  feeds: 0        // сколько раз насыпал корм
 };
 const IDLE_MS = 2 * 60 * 60 * 1000;   // каждые 2 часа
 const IDLE_COINS = 10;
@@ -1875,6 +1922,10 @@ function loadSave() {
     }
     const cl = JSON.parse(localStorage.getItem('marquis_cleared') || '[]');
     if (Array.isArray(cl)) GAME.cleared = cl;
+    const ac = JSON.parse(localStorage.getItem('marquis_ach') || '[]');
+    if (Array.isArray(ac)) GAME.ach = ac;
+    const fd = parseInt(localStorage.getItem('marquis_feeds') || '0', 10);
+    if (!isNaN(fd)) GAME.feeds = fd;
     const ts = parseInt(localStorage.getItem('marquis_coin_ts') || '0', 10);
     GAME.lastCoin = ts > 0 ? ts : Date.now();
   } catch (err) {}
@@ -1886,6 +1937,8 @@ function persist() {
     localStorage.setItem('marquis_owned', JSON.stringify(GAME.owned));
     localStorage.setItem('marquis_equip', JSON.stringify(GAME.equip));
     localStorage.setItem('marquis_cleared', JSON.stringify(GAME.cleared));
+    localStorage.setItem('marquis_ach', JSON.stringify(GAME.ach));
+    localStorage.setItem('marquis_feeds', String(GAME.feeds));
     localStorage.setItem('marquis_coin_ts', String(GAME.lastCoin));
   } catch (err) {}
 }
@@ -1896,19 +1949,86 @@ function updateCoinsUI() {
 }
 
 let toastTimer = null;
+let toastBusy = false;
+const toastQueue = [];
 
-function toast(msg) {
+/* всплывашка с очередью: достижение не перебьёт «+50 ⛁» */
+function toast(msg, ms) {
   const el = $('toast');
   if (!el) return;
+  if (toastBusy) { toastQueue.push([msg, ms || 1900]); return; }
+  showToast(msg, ms || 1900);
+}
+
+function showToast(msg, ms) {
+  const el = $('toast');
+  if (!el) return;
+  toastBusy = true;
   el.textContent = msg;
   el.classList.add('show');
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(function () { el.classList.remove('show'); }, 1900);
+  toastTimer = setTimeout(function () {
+    el.classList.remove('show');
+    toastBusy = false;
+    toastTimer = null;
+    if (toastQueue.length) {
+      const next = toastQueue.shift();
+      setTimeout(function () { showToast(next[0], next[1]); }, 240);
+    }
+  }, ms);
+}
+
+/* ---------- ДОСТИЖЕНИЯ ----------
+   Только всплывашки, без новых экранов и кнопок.
+   Список открытых хранится в localStorage (marquis_ach). */
+const ACH = {
+  night1:  { ru: 'ПЕРВАЯ НОЧЬ',      en: 'FIRST NIGHT' },
+  night3:  { ru: 'ТРЕТЬЯ НОЧЬ',      en: 'NIGHT THREE' },
+  night6:  { ru: 'ШЕСТАЯ НОЧЬ',      en: 'NIGHT SIX' },
+  all:     { ru: 'ВСЕ 6 НОЧЕЙ',      en: 'ALL 6 NIGHTS' },
+  coins500:{ ru: '500 МОНЕТ',        en: '500 COINS' },
+  coins1000:{ ru: '1000 МОНЕТ',      en: '1000 COINS' },
+  shop1:   { ru: 'ПЕРВЫЙ СКИН',      en: 'FIRST SKIN' },
+  shop10:  { ru: '10 СКИНОВ',        en: '10 SKINS' },
+  feed1:   { ru: 'ПЕРВЫЙ КОРМ',      en: 'FIRST FEED' },
+  feed10:  { ru: 'НАКОРМИЛ 10 РАЗ',  en: 'FED 10 TIMES' }
+};
+
+function achUnlock(id) {
+  const a = ACH[id];
+  if (!a) return false;
+  if (GAME.ach.indexOf(id) !== -1) return false;
+  GAME.ach.push(id);
+  persist();
+  const word = LANG === 'en' ? 'ACHIEVEMENT' : 'ДОСТИЖЕНИЕ';
+  toast('🏆 ' + word + ': ' + (LANG === 'en' ? a.en : a.ru), 2600);
+  if (Audio_.enabled) { Audio_.tone(880, 0.12, 0.10, 'triangle'); Audio_.tone(1320, 0.20, 0.08, 'triangle'); }
+  return true;
+}
+
+function achCheckCoins() {
+  if (GAME.coins >= 500) achUnlock('coins500');
+  if (GAME.coins >= 1000) achUnlock('coins1000');
+}
+
+function achCheckShop() {
+  if (GAME.owned.length > 3) achUnlock('shop1');
+  if (GAME.owned.length >= 10) achUnlock('shop10');
+}
+
+function achCheckNights() {
+  if (GAME.cleared.indexOf(1) !== -1) achUnlock('night1');
+  if (GAME.cleared.indexOf(3) !== -1) achUnlock('night3');
+  if (GAME.cleared.indexOf(6) !== -1) achUnlock('night6');
+  let all = true;
+  for (let i = 1; i <= MAX_NIGHT; i++) if (GAME.cleared.indexOf(i) === -1) { all = false; break; }
+  if (all) achUnlock('all');
 }
 
 function addCoins(n) {
   GAME.coins += n;
   updateCoinsUI();
+  achCheckCoins();
 }
 
 function idleTick() {
@@ -1931,6 +2051,7 @@ function grantNightCoins(n) {
   addCoins(gain);
   persist();
   toast('+' + gain + ' ⛁' + (first ? t('forNight') : ''));
+  achCheckNights();
 }
 
 function shopItem(cat, id) {
@@ -2015,6 +2136,7 @@ function buyOrEquip(cat, item) {
     GAME.owned.push(item.id);
     toast(t('bought') + itemName(item));
     if (Audio_.enabled) Audio_.chime();
+    achCheckShop();
   }
   GAME.equip[cat] = item.id;
   persist();
@@ -2695,6 +2817,7 @@ function drainEvents() {
       case 'foodlow': if (Audio_.enabled) Audio_.tone(330, 0.16, 0.12, 'triangle'); break;
       case 'hungry': if (Audio_.enabled) { Audio_.tone(90, 1.4, 0.4, 'sawtooth', 40); Audio_.noise(0.8, 0.3, 'lowpass', 300); } break;
       case 'light': if (Audio_.enabled) Audio_.noise(0.08, 0.12, 'bandpass', 3200, 2); break;
+      case 'hiss': if (Audio_.enabled) Audio_.hiss(); break;
       case 'camsopen': if (Audio_.enabled) Audio_.staticOn(); break;
       case 'camsclose': if (Audio_.enabled) Audio_.staticOff(); break;
       case 'camswitch': if (Audio_.enabled) Audio_.noise(0.10, 0.10, 'highpass', 2200); break;
